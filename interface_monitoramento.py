@@ -1,89 +1,97 @@
-# streamlit_app.py
 import streamlit as st
 import asyncio
 from bleak import BleakClient, BleakScanner
-import re
 import pandas as pd
 from datetime import datetime
 
-# Configurações iniciais
-CHAR_UUID = "0000xxxx-0000-1000-8000-00805f9b34fb"  # substitua com UUID real
-DEVICE_NAME = "XIAO_TENIS"  # substitua com nome correto
-
-st.set_page_config(page_title="Monitoramento Sensorial", layout="centered")
+st.set_page_config(page_title="Sensor IMU BLE", layout="centered")
 st.title("🎾 Monitoramento em Tempo Real do Sensor IMU")
-st.text_input("CHAR_UUID", CHAR_UUID, key="char_uuid_input")
-st.text_input("DEVICE_NAME", DEVICE_NAME, key="device_name_input")
 
-# Iniciar buffers se ainda não foram iniciados
-if "data_buffer" not in st.session_state:
-    st.session_state.data_buffer = pd.DataFrame(columns=["timestamp", "ax", "ay", "az", "battery"])
+# Session state
+if "dispositivos" not in st.session_state:
+    st.session_state.dispositivos = []
+if "dados" not in st.session_state:
+    st.session_state.dados = []
+if "caracteristicas" not in st.session_state:
+    st.session_state.caracteristicas = []
+if "endereco_conectado" not in st.session_state:
+    st.session_state.endereco_conectado = ""
 
-# Placeholder para widgets
-acc_placeholder = st.empty()
-bat_placeholder = st.empty()
-
-chart_ax = st.line_chart()
-chart_ay = st.line_chart()
-chart_az = st.line_chart()
-
-# Função para extrair valores
-def parse_data(data_str):
-    match = re.findall(r"[-+]?\d*\.\d+|\d+", data_str)
-    if len(match) >= 4:
-        ax, ay, az, battery = map(float, match)
-        return ax, ay, az, battery
-    return None
-
-# Callback BLE
-def callback(sender, data):
-    decoded = data.decode("utf-8")
-    parsed = parse_data(decoded)
-
-    if parsed:
-        ax, ay, az, battery = parsed
-        timestamp = datetime.now().strftime("%H:%M:%S")
-
-        # Adiciona nova linha ao buffer
-        new_row = {"timestamp": timestamp, "ax": ax, "ay": ay, "az": az, "battery": battery}
-        st.session_state.data_buffer = pd.concat(
-            [st.session_state.data_buffer, pd.DataFrame([new_row])],
-            ignore_index=True
-        )
-
-        # Manter os últimos 50 valores apenas
-        if len(st.session_state.data_buffer) > 50:
-            st.session_state.data_buffer = st.session_state.data_buffer.tail(50).reset_index(drop=True)
-
-        # Atualiza widgets
-        acc_placeholder.metric("📊 Aceleração (g)", f"X: {ax:.2f} | Y: {ay:.2f} | Z: {az:.2f}")
-        bat_placeholder.progress(int(battery), text=f"🔋 Bateria: {battery:.0f}%")
-
-        # Atualiza gráficos
-        chart_ax.line_chart(st.session_state.data_buffer[["timestamp", "ax"]].set_index("timestamp"))
-        chart_ay.line_chart(st.session_state.data_buffer[["timestamp", "ay"]].set_index("timestamp"))
-        chart_az.line_chart(st.session_state.data_buffer[["timestamp", "az"]].set_index("timestamp"))
-
-# Conexão BLE
-async def read_data(address):
-    async with BleakClient(address) as client:
-        await client.start_notify(CHAR_UUID, callback)
-        while True:
-            await asyncio.sleep(1)
-
-async def run():
+# 🔍 Scanner BLE
+async def procurar_dispositivos():
     devices = await BleakScanner.discover()
-    xiao = next((d for d in devices if DEVICE_NAME in d.name), None)
+    return [(d.name or "Desconhecido", d.address) for d in devices]
 
-    if not xiao:
-        st.error("Dispositivo XIAO não encontrado. Verifique se está ligado.")
-        return
+# 📑 Listar características
+async def listar_caracteristicas(address):
+    async with BleakClient(address) as client:
+        services = await client.get_services()
+        return [(char.uuid, char.properties) for service in services for char in service.characteristics]
 
-    await read_data(xiao.address)
+# 📡 Callback para notify
+def notification_handler(sender, data):
+    try:
+        valor = float(data.decode('utf-8').strip())  # Tenta converter para float
+    except:
+        valor = data.decode('utf-8').strip()
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    st.session_state.dados.append({"Horário": timestamp, "Valor": valor})
 
-# Executar a rotina BLE se ainda não foi iniciada
-if "ble_started" not in st.session_state:
-    st.session_state.ble_started = True
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(run())
+# 🔗 Conectar e receber
+async def conectar_e_receber(address, char_uuid):
+    async with BleakClient(address) as client:
+        if await client.is_connected():
+            st.success(f"🔗 Conectado ao {address}")
+            try:
+                await client.start_notify(char_uuid, notification_handler)
+                await asyncio.sleep(10)  # Leitura por 10s
+                await client.stop_notify(char_uuid)
+            except Exception as e:
+                st.error(f"Erro ao iniciar/parar notify: {e}")
+        else:
+            st.error("❌ Não foi possível conectar.")
+
+# Botão escanear dispositivos
+if st.button("🔍 Escanear dispositivos BLE"):
+    st.session_state.dispositivos = asyncio.run(procurar_dispositivos())
+    st.session_state.dados.clear()
+
+# Se dispositivos foram encontrados
+if st.session_state.dispositivos:
+    opcoes = [f"{nome} - {addr}" for nome, addr in st.session_state.dispositivos]
+    selecao = st.selectbox("Selecione um dispositivo:", opcoes)
+    index = opcoes.index(selecao)
+    endereco = st.session_state.dispositivos[index][1]
+    st.session_state.endereco_conectado = endereco
+
+    # Botão para listar características
+    if st.button("📑 Listar características"):
+        st.session_state.caracteristicas = asyncio.run(listar_caracteristicas(endereco))
+
+# Se características disponíveis
+if st.session_state.caracteristicas:
+    st.subheader("📋 Características disponíveis:")
+    tabela_caracts = [{"UUID": uuid, "Propriedades": ", ".join(props)} for uuid, props in st.session_state.caracteristicas]
+    st.table(tabela_caracts)
+
+    # Apenas as com notify
+    notify_uuids = [uuid for uuid, props in st.session_state.caracteristicas if "notify" in props]
+    if notify_uuids:
+        char_escolhida = st.selectbox("Selecione UUID para leitura:", notify_uuids)
+
+        if st.button("🟢 Iniciar leitura (10s)"):
+            asyncio.run(conectar_e_receber(st.session_state.endereco_conectado, char_escolhida))
+
+# Mostrar dados ao vivo
+if st.session_state.dados:
+    st.subheader("📊 Dados recebidos:")
+    df = pd.DataFrame(st.session_state.dados)
+
+    # Gráfico
+    if df["Valor"].apply(lambda x: isinstance(x, float)).all():
+        st.line_chart(df.set_index("Horário")["Valor"])
+    st.dataframe(df, use_container_width=True)
+
+    # Exportar CSV
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Baixar CSV", csv, "dados_ble.csv", "text/csv")
